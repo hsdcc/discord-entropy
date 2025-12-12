@@ -197,28 +197,45 @@ done
 echo "generating $ENTROPY_SIZE bytes of random data from collected content..."
 
 # Use the combined content as entropy source to generate random data
-# Method 1: Use openssl to generate random data seeded with our content
-if command -v openssl >/dev/null 2>&1; then
-    # Hash the combined content to use as seed
+# Generate random-like data from the content using deterministic methods
+
+# Method: Use SHA256 hash of the content as base, then expand it deterministically
+if command -v sha256sum >/dev/null 2>&1; then
+    # Get initial seed from hashing the content
     SEED=$(sha256sum "$COMBINED_FILE" | cut -d' ' -f1)
     
-    # Generate random data using the seed
-    openssl enc -aes-256-ctr -pass pass:"$SEED" -nosalt < /dev/zero 2>/dev/null | head -c $ENTROPY_SIZE
+    # Function to generate random-like data by chaining hashes
+    generate_from_seed() {
+        local current_hash="$1"
+        local remaining_bytes="$2"
+        
+        while [ "$remaining_bytes" -gt 0 ]; do
+            # Calculate how many bytes we can get from this hash
+            chunk_size=32  # Each SHA256 hash gives us 32 bytes
+            
+            if [ "$remaining_bytes" -ge "$chunk_size" ]; then
+                # Use full chunk
+                echo -n "$current_hash" | xxd -r -p 2>/dev/null
+                remaining_bytes=$((remaining_bytes - chunk_size))
+            else
+                # Use partial chunk
+                echo -n "$current_hash" | xxd -r -p 2>/dev/null | head -c "$remaining_bytes"
+                remaining_bytes=0
+            fi
+            
+            # Prepare next hash
+            if [ "$remaining_bytes" -gt 0 ]; then
+                current_hash=$(echo -n "$current_hash" | sha256sum | cut -d' ' -f1)
+            fi
+        done
+    }
     
-elif command -v md5sum >/dev/null 2>&1; then
-    # Alternative method using md5sum if openssl is not available
-    SEED=$(md5sum "$COMBINED_FILE" | cut -d' ' -f1)
-    COUNTER=0
-    while [ $COUNTER -lt $ENTROPY_SIZE ]; do
-        # Generate random data chunk using the seed
-        echo -n "$SEED" | md5sum | tr -d ' -' | xxd -r -p 2>/dev/null | head -c $((ENTROPY_SIZE - COUNTER))
-        COUNTER=$((COUNTER + 32))  # md5sum produces 32 hex chars = 16 bytes
-    done
+    generate_from_seed "$SEED" $ENTROPY_SIZE
 else
-    # Fallback to using the content directly
-    # Repeat the content to reach the required size
+    # Alternative: Use the content directly if sha256sum isn't available
     CONTENT_LEN=$(stat -c%s "$COMBINED_FILE" 2>/dev/null || echo 1)
     if [ "$CONTENT_LEN" -gt 0 ]; then
+        # Calculate how many times to repeat the content to reach desired size
         REPEAT_TIMES=$((ENTROPY_SIZE / CONTENT_LEN + 1))
         for i in $(seq 1 $REPEAT_TIMES); do
             cat "$COMBINED_FILE"
@@ -227,7 +244,8 @@ else
             fi
         done | head -c $ENTROPY_SIZE
     else
-        # Final fallback: use system urandom
-        dd if=/dev/urandom bs=$ENTROPY_SIZE count=1 2>/dev/null
+        # If we have no content, we can't generate meaningful entropy
+        echo "warning: no content collected for entropy generation"
+        exit 1
     fi
 fi
