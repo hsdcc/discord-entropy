@@ -85,6 +85,54 @@ handle_rate_limit() {
     sleep "$retry_after"
 }
 
+# Function to generate a continuous stream of entropy (endless output)
+generate_entropy_stream() {
+    local temp_dir="$1"
+    
+    # Create combined content file for entropy
+    COMBINED_FILE="$temp_dir/combined_content.txt"
+    cat "$temp_dir/text_content.txt" > "$COMBINED_FILE"
+
+    # Add image file contents to combined file (as raw bytes)
+    for img in "$temp_dir"/images/*; do
+        if [ -f "$img" ]; then
+            # Append the raw bytes of the image to the combined file
+            cat "$img" >> "$COMBINED_FILE"
+        fi
+    done
+
+    # For streaming, keep generating new entropy indefinitely
+    while true; do
+        # Method: Use SHA256 hash of the content as base, then expand it deterministically
+        if command -v sha256sum >/dev/null 2>&1; then
+            # Get initial seed from hashing the content
+            SEED=$(sha256sum "$COMBINED_FILE" | cut -d' ' -f1)
+            
+            # Function to generate random-like data by chaining hashes
+            local_generate_from_seed() {
+                local current_hash="$1"
+                
+                # Keep generating data indefinitely
+                while true; do
+                    # Convert the hex hash to actual bytes
+                    echo -n "$current_hash" | xxd -r -p 2>/dev/null
+                    
+                    # Generate next hash
+                    current_hash=$(echo -n "$current_hash" | sha256sum | cut -d' ' -f1)
+                done
+            }
+            
+            local_generate_from_seed "$SEED"
+        else
+            # Alternative: Use the content directly if sha256sum isn't available
+            # Since this should be continuous, just keep repeating the content
+            while true; do
+                cat "$COMBINED_FILE"
+            done
+        fi
+    done
+}
+
 # function to handle FIFO mode - creates a named pipe that continuously generates random data
 handle_fifo_mode() {
     local fifo_path="/tmp/discordrandom"
@@ -117,26 +165,22 @@ handle_fifo_mode() {
     echo "read from it to receive continuous random data: cat $fifo_path"
     echo "press Ctrl+C to stop the service"
     
-    # Main loop: continuously generate and write random data to the FIFO
+    # Main loop: refresh content periodically and stream entropy
     while true; do
-        # Fetch fresh content for entropy each iteration
+        # Refresh content to get new entropy sources
         fetch_discord_content "$temp_dir"
         
-        # Run the entropy generation part and write to the FIFO
-        # Capture the output of the normal entropy generation process
-        local entropy_data
-        entropy_data=$(generate_entropy "$temp_dir")
+        # Continuously feed entropy stream to FIFO
+        # The generate_entropy_stream function will run endlessly until killed
+        generate_entropy_stream "$temp_dir" > "$fifo_path" 2>/dev/null &
+        STREAM_PID=$!
         
-        if [ -p "$fifo_path" ]; then
-            # Write to FIFO - this will block until someone reads from it
-            echo -n "$entropy_data" > "$fifo_path" 2>/dev/null
-        else
-            # FIFO was removed, exit gracefully
-            break
-        fi
+        # Wait for a period before refreshing content
+        sleep 10  # Refresh content every 10 seconds
         
-        # Small delay to prevent overwhelming the system
-        sleep 0.1
+        # Kill the current stream to force a recalculation with new content
+        kill $STREAM_PID 2>/dev/null
+        wait $STREAM_PID 2>/dev/null
     done
 }
 
